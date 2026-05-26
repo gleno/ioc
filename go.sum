@@ -1,4 +1,4 @@
-github.com/gleno/fault v1.0.0 h1:5tgYUpcOVOq9mZ+X1pZmN9wCnN1QV/z+2TJNsWO/GOQ=
-github.com/gleno/fault v1.0.0/go.mod h1:1IWhHFfHHyLv5lcDxI7Z8I1NrdQIqch0VzSqEM1UKRc=
+github.com/gleno/fault v1.0.2 h1:+kg7Bv8EvB+G+1/PycrBs+UrK0be6zdaTBX+zR3Dfvs=
+github.com/gleno/fault v1.0.2/go.mod h1:1IWhHFfHHyLv5lcDxI7Z8I1NrdQIqch0VzSqEM1UKRc=
 github.com/pkg/errors v0.9.1 h1:FEBLx1zS214owpjy7qsBeixbURkuhQAwrK5UwLGTwt4=
 github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
