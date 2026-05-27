@@ -495,6 +495,27 @@ func TestWithProvidedVoidFunction(t *testing.T) {
 	_ = WithProvided(ctx, voidFunc)
 }
 
+func TestWithProvidedTypedNilFunction(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			if err, ok := r.(error); ok && errors.Is(err, InvalidInjectable) {
+				// Expected behavior - a typed nil func value is an invalid injectable
+			} else {
+				t.Fatalf("Expected InvalidInjectable panic, got %v", r)
+			}
+		} else {
+			t.Fatal("Expected panic for typed nil function injectable, but code did not panic")
+		}
+	}()
+
+	ctx := context.Background()
+
+	var nilFunc func() *_ServeServiceImpl = nil
+
+	// A typed nil func slips past the injectable == nil guard; it must still be rejected.
+	_ = WithProvided(ctx, nilFunc)
+}
+
 func TestWithProvidedNilDirectly(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -541,31 +562,33 @@ func TestWithProvidedCallableReturningNonPointer(t *testing.T) {
 	print(item)
 }
 
-func TestWithProvidedCallableInjectableReturningNilInterface(t *testing.T) {
-	ctx := context.Background()
-
-	// Function that returns an interface{} that is nil
-	factory := func() any {
-		return nil
-	}
-
-	// WithProvided should not panic - the function is stored as lazy factory
-	ctx = WithProvided(ctx, factory)
-
-	// The panic should happen when we try to GetProvided (when the factory is invoked)
+func TestWithProvidedRejectsAnyReturningFactory(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {
 			if err, ok := r.(error); ok && errors.Is(err, InvalidInjectable) {
-				// Expected behavior - functions returning nil interfaces should be rejected on first use
-			} else {
-				t.Fatalf("Expected InvalidInjectable panic, got %v", r)
+				return
 			}
-		} else {
-			t.Fatal("Expected panic for function returning nil interface, but code did not panic")
+			t.Fatalf("Expected InvalidInjectable panic, got %v", r)
 		}
+		t.Fatal("Expected WithProvided to reject a func() any factory, but it did not panic")
 	}()
 
-	// This should panic because the factory returns nil when called
+	WithProvided(context.Background(), func() any { return &_ServeServiceImpl{} })
+}
+
+func TestWithProvidedCallableReturningNilNamedInterface(t *testing.T) {
+	ctx := WithProvided(context.Background(), func() ServeService { return nil })
+
+	defer func() {
+		if r := recover(); r != nil {
+			if err, ok := r.(error); ok && errors.Is(err, InvalidInjectable) {
+				return
+			}
+			t.Fatalf("Expected InvalidInjectable panic, got %v", r)
+		}
+		t.Fatal("Expected panic for factory returning a nil named interface, but code did not panic")
+	}()
+
 	_ = GetProvided[ServeService](ctx)
 }
 
@@ -767,29 +790,6 @@ type _serviceContext struct {
 	context.Context
 }
 
-func (c *_serviceContext) Serve() string {
-	return "from context"
-}
-
-func TestGetProvidedFromContextDirectly(t *testing.T) {
-	var ctx = &_serviceContext{Context: context.Background()}
-
-	var retrieved = GetProvided[ServeService](ctx)
-	if retrieved.Serve() != "from context" {
-		t.Fatal("expected to find Service from context itself")
-	}
-}
-
-func TestInjectableTakesPriorityOverContext(t *testing.T) {
-	var ctx = &_serviceContext{Context: context.Background()}
-	var injected = WithProvided(ctx, &_ServeServiceImpl{})
-
-	var retrieved = GetProvided[ServeService](injected)
-	if retrieved.Serve() != "Service is serving" {
-		t.Fatal("expected injectable to take priority over context")
-	}
-}
-
 func TestGetProvidedFromDeepStoredContext(t *testing.T) {
 	var customCtx = &_serviceContext{Context: context.Background()}
 	var ctx = WithProvided(customCtx, &_DoSomethingServiceImpl{})
@@ -798,34 +798,6 @@ func TestGetProvidedFromDeepStoredContext(t *testing.T) {
 	var retrieved = GetProvided[DoSomethingService](ctx)
 	if retrieved.DoSomething() != "Another service is doing something" {
 		t.Fatal("expected to find Service from deeply stored context")
-	}
-}
-
-func TestIsProvidedFromContext(t *testing.T) {
-	var ctx = &_serviceContext{Context: context.Background()}
-
-	if !IsProvided[ServeService](ctx) {
-		t.Fatal("expected IsProvided to return true when context implements interface")
-	}
-}
-
-func TestGetOptionalProvidedFromContext(t *testing.T) {
-	var ctx = &_serviceContext{Context: context.Background()}
-
-	value, found := GetOptionalProvided[ServeService](ctx)
-	if !found {
-		t.Fatal("expected found to be true when context implements interface")
-	}
-	if value.Serve() != "from context" {
-		t.Fatal("expected service from context")
-	}
-}
-
-func TestContextDoesNotMatchUnrelatedInterface(t *testing.T) {
-	var ctx = &_serviceContext{Context: context.Background()}
-
-	if IsProvided[DoSomethingService](ctx) {
-		t.Fatal("expected IsProvided to return false for unimplemented interface")
 	}
 }
 
@@ -882,6 +854,22 @@ func TestNestedOverride(t *testing.T) {
 	}
 }
 
+func TestForeignStringKeyDoesNotCorruptResolution(t *testing.T) {
+	var ctx = context.Background()
+	ctx = WithProvided(ctx, &_ServeServiceImpl{})
+
+	ctx = context.WithValue(ctx, "ioc", "some foreign value")
+
+	if !IsProvided[ServeService](ctx) {
+		t.Fatal("a foreign string key \"ioc\" must not shadow the ioc chain")
+	}
+
+	var retrieved = GetProvided[ServeService](ctx)
+	if retrieved.Serve() != "Service is serving" {
+		t.Fatal("resolution corrupted by foreign string key collision")
+	}
+}
+
 func TestGetConcreteValue(t *testing.T) {
 	var ctx = context.Background()
 	ctx = WithProvided(ctx, &_DoAServiceImpl{})
@@ -907,4 +895,100 @@ func TestGetDeepConcreteValue(t *testing.T) {
 	if value.DoA() != "A" {
 		t.Fatal("expected to call method on concrete type from deep context")
 	}
+}
+
+func TestWithProvidedCallableReturningNilFunc(t *testing.T) {
+	ctx := context.Background()
+
+	type Handler func() string
+
+	factory := func() Handler {
+		return nil
+	}
+
+	ctx = WithProvided(ctx, factory)
+
+	defer func() {
+		if r := recover(); r != nil {
+			if err, ok := r.(error); ok && errors.Is(err, InvalidInjectable) {
+				// Expected: a returned nil func is uncallable and must be rejected on first resolve.
+			} else {
+				t.Fatalf("Expected InvalidInjectable panic, got %v", r)
+			}
+		} else {
+			t.Fatal("Expected panic for factory returning nil func, but code did not panic")
+		}
+	}()
+
+	_ = GetProvided[Handler](ctx)
+}
+
+func TestWithProvidedRejectsTypedNilPointer(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			if err, ok := r.(error); ok && errors.Is(err, InvalidInjectable) {
+				return
+			}
+			t.Fatalf("Expected InvalidInjectable panic, got %v", r)
+		}
+		t.Fatal("Expected WithProvided to reject a typed-nil pointer, but it did not panic")
+	}()
+
+	var nilImpl *_ServeServiceImpl = nil
+	WithProvided(context.Background(), nilImpl)
+}
+
+func TestFactoryNotInvokedResolvingUnrelatedType(t *testing.T) {
+	var calls int
+	factory := func() *_DoSomethingServiceImpl {
+		calls++
+		return &_DoSomethingServiceImpl{}
+	}
+
+	ctx := WithProvided(context.Background(), factory)
+	ctx = WithProvided(ctx, &_ServeServiceImpl{})
+
+	GetProvided[ServeService](ctx)
+	if calls != 0 {
+		t.Fatalf("factory for an unrelated type was invoked %d times resolving ServeService, want 0", calls)
+	}
+
+	GetProvided[DoSomethingService](ctx)
+	if calls != 1 {
+		t.Fatalf("factory invoked %d times after resolving its own type, want 1", calls)
+	}
+}
+
+func TestUnrelatedBrokenFactoryDoesNotBlockParent(t *testing.T) {
+	parent := WithProvided(context.Background(), &_DoSomethingServiceImpl{})
+	child := WithProvided(parent, func() ServeService { panic("unrelated factory boom") })
+
+	if value, found := GetOptionalProvided[DoSomethingService](child); !found || value == nil {
+		t.Fatal("expected parent's DoSomethingService to resolve despite an unrelated broken child factory")
+	}
+	if !IsProvided[DoSomethingService](child) {
+		t.Fatal("expected IsProvided to be true for the parent's DoSomethingService")
+	}
+	if GetProvided[DoSomethingService](child).DoSomething() != "Another service is doing something" {
+		t.Fatal("expected the parent's DoSomethingService instance")
+	}
+}
+
+func TestWithProvidedCallableReturningTypedNilViaInterface(t *testing.T) {
+	ctx := WithProvided(context.Background(), func() ServeService {
+		var nilImpl *_ServeServiceImpl = nil
+		return nilImpl
+	})
+
+	defer func() {
+		if r := recover(); r != nil {
+			if err, ok := r.(error); ok && errors.Is(err, InvalidInjectable) {
+				return
+			}
+			t.Fatalf("Expected InvalidInjectable panic, got %v", r)
+		}
+		t.Fatal("Expected panic for factory returning a typed-nil pointer via an interface, but code did not panic")
+	}()
+
+	_ = GetProvided[ServeService](ctx)
 }

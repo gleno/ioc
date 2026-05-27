@@ -9,9 +9,9 @@ import (
 	"github.com/gleno/fault"
 )
 
-const (
-	iocContextKey = "ioc"
-)
+type iocContextKeyType struct{}
+
+var iocContextKey = iocContextKeyType{}
 
 var (
 	InjectionError    = fault.Sentinel("injection error")
@@ -19,31 +19,32 @@ var (
 	MissingInjectable = InjectionError.WithMessage("missing injectable")
 )
 
+type _lazyInjectable struct {
+	value   func() any
+	outType reflect.Type
+}
+
 type _iocContext struct {
 	parent     *_iocContext
 	injectable any
-	// For lazy callables, we store the sync.OnceValue func
-	lazyFactory func() any
 }
 
 func findProvided[T any](ctx context.Context) (value T, found bool) {
 
 	iocContext, _ := ctx.Value(iocContextKey).(*_iocContext)
+	var tType = reflect.TypeFor[T]()
 
 	for ic := iocContext; ic != nil; ic = ic.parent {
-		var v any
-		if ic.lazyFactory != nil {
-			v = ic.lazyFactory()
-		} else {
-			v = ic.injectable
+		var v = ic.injectable
+		if lazy, ok := v.(*_lazyInjectable); ok {
+			if !lazy.outType.AssignableTo(tType) {
+				continue
+			}
+			v = lazy.value()
 		}
 		if matched, ok := v.(T); ok {
 			return matched, true
 		}
-	}
-
-	if matched, ok := ctx.(T); ok {
-		return matched, true
 	}
 
 	return
@@ -52,8 +53,7 @@ func findProvided[T any](ctx context.Context) (value T, found bool) {
 func GetProvided[T any](ctx context.Context) T {
 	value, found := findProvided[T](ctx)
 	if !found {
-		var tType = reflect.TypeOf((*T)(nil)).Elem()
-		panic(fault.From(MissingInjectable, tType.String()))
+		panic(fault.From(MissingInjectable, reflect.TypeFor[T]().String()))
 	}
 	return value
 }
@@ -75,12 +75,15 @@ func WithProvided[TContext context.Context](ctx TContext, injectables ...any) co
 			panic(fault.From(InvalidInjectable, "nil"))
 		}
 
-		// injectable could be callable?
-		if reflect.TypeOf(injectable).Kind() == reflect.Func {
-			var funcValue = reflect.ValueOf(injectable)
-			var funcType = funcValue.Type()
+		var injectableValue = reflect.ValueOf(injectable)
 
-			// Check if function has parameters
+		if injectableValue.Kind() == reflect.Func {
+			var funcType = injectableValue.Type()
+
+			if injectableValue.IsNil() {
+				panic(fault.From(InvalidInjectable, "nil function"))
+			}
+
 			if funcType.NumIn() > 0 {
 				panic(fault.From(InvalidInjectable, "function cannot have parameters"))
 			}
@@ -89,27 +92,33 @@ func WithProvided[TContext context.Context](ctx TContext, injectables ...any) co
 				panic(fault.From(InvalidInjectable, fmt.Sprintf("function must return one value, but has %d ", funcType.NumOut())))
 			}
 
-			var lazyFactory = sync.OnceValue(func() any {
+			var outType = funcType.Out(0)
+			if outType.Kind() == reflect.Interface && outType.NumMethod() == 0 {
+				panic(fault.From(InvalidInjectable, "factory must return a concrete type, not interface{}"))
+			}
 
-				var results = funcValue.Call(nil)
+			var factory = sync.OnceValue(func() any {
 
-				// Use the first return value (we know results has at least one element due to NumOut() > 0 check above)
-				var result = results[0]
-				if result.Kind() == reflect.Ptr && result.IsNil() {
+				var result = injectableValue.Call(nil)[0]
+				var produced = result
+				if produced.Kind() == reflect.Interface {
+					if produced.IsNil() {
+						panic(fault.From(InvalidInjectable, "function returned nil"))
+					}
+					produced = produced.Elem()
+				}
+				if (produced.Kind() == reflect.Ptr || produced.Kind() == reflect.Func) && produced.IsNil() {
 					panic(fault.From(InvalidInjectable, "function returned nil"))
 				}
 
-				var value = result.Interface()
-				if value == nil {
-					panic(fault.From(InvalidInjectable, "function returned nil"))
-				}
-
-				return value
+				return result.Interface()
 			})
 
-			// Store as lazy callable
-			iocContext = &_iocContext{parent: iocContext, lazyFactory: lazyFactory}
+			iocContext = &_iocContext{parent: iocContext, injectable: &_lazyInjectable{value: factory, outType: outType}}
 		} else {
+			if injectableValue.Kind() == reflect.Ptr && injectableValue.IsNil() {
+				panic(fault.From(InvalidInjectable, "nil pointer"))
+			}
 			iocContext = &_iocContext{parent: iocContext, injectable: injectable}
 		}
 	}

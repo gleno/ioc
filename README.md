@@ -13,9 +13,8 @@ go get github.com/gleno/ioc
 - **Context-scoped.** Injectables live on a `context.Context`. Anything that has the context can resolve them; child contexts inherit everything from their parents.
 - **Resolve by type.** `GetProvided[T]` matches a stored value against the requested type `T` — interface or concrete — using Go's normal type assertion. One implementation can satisfy many interfaces.
 - **Generic, no reflection at the call site.** Resolution is type-safe; you get a `T` back, not an `any` to cast.
-- **Lazy factories.** Provide a zero-arg function `func() T` and it's invoked at most once, the first time the value is resolved (`sync.OnceValue`). The same instance is returned on every subsequent resolve.
+- **Lazy factories.** Provide a zero-arg function `func() T` and it's invoked at most once — the first time a `T` is resolved (`sync.OnceValue`), and never as a side effect of resolving an unrelated type. A factory resolves as its declared return type `T`, which must be a concrete or named-interface type (not `interface{}`).
 - **Most-recent-wins overrides.** Providing a second value satisfying the same interface shadows the earlier one — useful for layering defaults then overriding in tests or nested scopes.
-- **The context itself can be an injectable.** If the `context.Context` you pass implements `T`, it resolves — explicit injectables take priority over this.
 - **Three resolution modes.** Panic-on-missing (`GetProvided`), boolean check (`IsProvided`), and optional `(T, bool)` (`GetOptionalProvided`).
 - **Typed errors.** Failures are `fault` sentinels (`MissingInjectable`, `InvalidInjectable`) you can match with `errors.Is`.
 
@@ -96,7 +95,7 @@ ctx = ioc.WithProvided(ctx, func() Greeter {
 g := ioc.GetProvided[Greeter](ctx) // factory runs here
 ```
 
-A factory must take no parameters and return exactly one value, or `WithProvided` panics with `InvalidInjectable`. If the factory returns nil, the panic happens on first resolve, not at registration.
+A factory must take no parameters and return exactly one value of a concrete or named-interface type, or `WithProvided` panics with `InvalidInjectable` — a `func() any` is rejected at registration, since its declared type carries no resolution information. A factory resolves only as its declared return type, and is invoked only when that type is requested. If the factory returns nil, the panic happens on first resolve, not at registration.
 
 ### Overrides: most-recent wins
 
@@ -120,22 +119,6 @@ child := context.WithValue(parent, key, val)
 g := ioc.GetProvided[Greeter](child) // resolves from parent
 ```
 
-### The context as an injectable
-
-If the context value itself implements the requested type, it resolves directly — no explicit `WithProvided` needed. Explicitly provided injectables take priority over the context.
-
-```go
-type serverContext struct {
-	context.Context
-}
-
-func (c *serverContext) Greet() string { return "from context" }
-
-ctx := &serverContext{Context: context.Background()}
-
-g := ioc.GetProvided[Greeter](ctx) // resolves the context itself
-```
-
 ## API
 
 ```go
@@ -157,7 +140,7 @@ func WithProvided[TContext context.Context](ctx TContext, injectables ...any) co
 ```go
 var (
 	InjectionError    // base sentinel for all injection failures
-	InvalidInjectable // nil injectable, or a malformed factory func
+	InvalidInjectable // nil injectable (incl. typed-nil pointer/func), or a malformed factory
 	MissingInjectable // no provided value satisfies the requested type
 )
 ```
