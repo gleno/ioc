@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"github.com/gleno/fault"
 )
@@ -14,14 +16,20 @@ type iocContextKeyType struct{}
 var iocContextKey = iocContextKeyType{}
 
 var (
-	InjectionError    = fault.Sentinel("injection error")
-	InvalidInjectable = InjectionError.WithMessage("invalid injectable")
-	MissingInjectable = InjectionError.WithMessage("missing injectable")
+	InjectionError     = fault.Sentinel("injection error")
+	InvalidInjectable  = InjectionError.WithMessage("invalid injectable")
+	MissingInjectable  = InjectionError.WithMessage("missing injectable")
+	CircularInjectable = InjectionError.WithMessage("circular injectable")
 )
 
 type _lazyInjectable struct {
-	value   func() any
+	resolve func() any
 	outType reflect.Type
+}
+
+func (l *_lazyInjectable) tryResolve() (value any, recovered any) {
+	defer func() { recovered = recover() }()
+	return l.resolve(), nil
 }
 
 type _iocContext struct {
@@ -29,10 +37,14 @@ type _iocContext struct {
 	injectable any
 }
 
-func findProvided[T any](ctx context.Context) (value T, found bool) {
+func findProvided[T any](ctx context.Context) (value T, found bool, recovered any) {
+
+	var tType = reflect.TypeFor[T]()
+	if tType.Kind() == reflect.Interface && tType.NumMethod() == 0 {
+		panic(fault.From(InvalidInjectable, "cannot resolve interface{}"))
+	}
 
 	iocContext, _ := ctx.Value(iocContextKey).(*_iocContext)
-	var tType = reflect.TypeFor[T]()
 
 	for ic := iocContext; ic != nil; ic = ic.parent {
 		var v = ic.injectable
@@ -40,18 +52,23 @@ func findProvided[T any](ctx context.Context) (value T, found bool) {
 			if !lazy.outType.AssignableTo(tType) {
 				continue
 			}
-			v = lazy.value()
+			if v, recovered = lazy.tryResolve(); recovered != nil {
+				return value, false, recovered
+			}
 		}
 		if matched, ok := v.(T); ok {
-			return matched, true
+			return matched, true, nil
 		}
 	}
 
-	return
+	return value, false, nil
 }
 
 func GetProvided[T any](ctx context.Context) T {
-	value, found := findProvided[T](ctx)
+	value, found, recovered := findProvided[T](ctx)
+	if recovered != nil {
+		panic(recovered)
+	}
 	if !found {
 		panic(fault.From(MissingInjectable, reflect.TypeFor[T]().String()))
 	}
@@ -59,12 +76,13 @@ func GetProvided[T any](ctx context.Context) T {
 }
 
 func IsProvided[T any](ctx context.Context) bool {
-	_, found := findProvided[T](ctx)
+	_, found, _ := findProvided[T](ctx)
 	return found
 }
 
 func GetOptionalProvided[T any](ctx context.Context) (T, bool) {
-	return findProvided[T](ctx)
+	value, found, _ := findProvided[T](ctx)
+	return value, found
 }
 
 func WithProvided[TContext context.Context](ctx TContext, injectables ...any) context.Context {
@@ -97,7 +115,10 @@ func WithProvided[TContext context.Context](ctx TContext, injectables ...any) co
 				panic(fault.From(InvalidInjectable, "factory must return a concrete type, not interface{}"))
 			}
 
-			var factory = sync.OnceValue(func() any {
+			var owner atomic.Int64
+			var once = sync.OnceValue(func() any {
+				owner.Store(goid())
+				defer owner.Store(0)
 
 				var result = injectableValue.Call(nil)[0]
 				var produced = result
@@ -107,21 +128,50 @@ func WithProvided[TContext context.Context](ctx TContext, injectables ...any) co
 					}
 					produced = produced.Elem()
 				}
-				if (produced.Kind() == reflect.Ptr || produced.Kind() == reflect.Func) && produced.IsNil() {
+				if isNilInjectable(produced) {
 					panic(fault.From(InvalidInjectable, "function returned nil"))
 				}
 
 				return result.Interface()
 			})
 
-			iocContext = &_iocContext{parent: iocContext, injectable: &_lazyInjectable{value: factory, outType: outType}}
+			var resolve = func() any {
+				if o := owner.Load(); o != 0 && o == goid() {
+					panic(fault.From(CircularInjectable, outType.String()))
+				}
+				return once()
+			}
+
+			iocContext = &_iocContext{parent: iocContext, injectable: &_lazyInjectable{resolve: resolve, outType: outType}}
 		} else {
-			if injectableValue.Kind() == reflect.Ptr && injectableValue.IsNil() {
-				panic(fault.From(InvalidInjectable, "nil pointer"))
+			if isNilInjectable(injectableValue) {
+				panic(fault.From(InvalidInjectable, "nil "+injectableValue.Kind().String()))
 			}
 			iocContext = &_iocContext{parent: iocContext, injectable: injectable}
 		}
 	}
 
 	return context.WithValue(ctx, iocContextKey, iocContext)
+}
+
+func isNilInjectable(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Func, reflect.Map, reflect.Slice, reflect.Chan:
+		return v.IsNil()
+	}
+	return false
+}
+
+func goid() int64 {
+	var buf [32]byte
+	var s = buf[:runtime.Stack(buf[:], false)]
+	s = s[len("goroutine "):]
+	var id int64
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			break
+		}
+		id = id*10 + int64(c-'0')
+	}
+	return id
 }
