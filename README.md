@@ -14,9 +14,9 @@ go get github.com/gleno/ioc
 - **Resolve by type.** `GetProvided[T]` matches a stored value against the requested type `T` — interface or concrete — using Go's normal type assertion. One implementation can satisfy many interfaces.
 - **Generic, no reflection at the call site.** Resolution is type-safe; you get a `T` back, not an `any` to cast.
 - **Lazy factories.** Provide a zero-arg function `func() T` and it's invoked at most once — the first time a `T` is resolved (`sync.OnceValue`), and never as a side effect of resolving an unrelated type. A factory resolves as its declared return type `T`, which must be a concrete or named-interface type (not `interface{}`).
-- **Most-recent-wins overrides.** Providing a second value satisfying the same interface shadows the earlier one — useful for layering defaults then overriding in tests or nested scopes.
+- **Ambiguity is loud.** If two providers satisfy the requested type, resolution **panics** rather than silently picking one. Replace a provider deliberately with `WithOverride`; pin a provider to exact types with `As`.
 - **Three resolution modes.** Panic-on-missing (`GetProvided`), boolean check (`IsProvided`), and optional `(T, bool)` (`GetOptionalProvided`).
-- **Typed errors.** Failures are `fault` sentinels (`MissingInjectable`, `InvalidInjectable`) you can match with `errors.Is`.
+- **Typed errors.** Failures are `fault` sentinels (`MissingInjectable`, `InvalidInjectable`, `AmbiguousInjectable`, `CircularInjectable`) you can match with `errors.Is`.
 
 ## Usage
 
@@ -56,7 +56,7 @@ func main() {
 ### Optional resolution and existence checks
 
 ```go
-// (T, bool) — never panics.
+// (T, bool) — never panics on absence (but does panic on ambiguity; see below).
 g, ok := ioc.GetOptionalProvided[Greeter](ctx)
 if ok {
 	fmt.Println(g.Greet())
@@ -97,15 +97,50 @@ g := ioc.GetProvided[Greeter](ctx) // factory runs here
 
 A factory must take no parameters and return exactly one value of a concrete or named-interface type, or `WithProvided` panics with `InvalidInjectable` — a `func() any` is rejected at registration, since its declared type carries no resolution information. A factory resolves only as its declared return type, and is invoked only when that type is requested. If the factory returns nil, the panic happens on first resolve, not at registration.
 
-### Overrides: most-recent wins
+### Ambiguity and overrides
 
-When two injectables satisfy the same type, the most recently provided one is resolved. This makes layering and overriding straightforward — for example, install defaults early and override in a nested scope.
+`WithProvided` asserts that what you add is *the* provider for the types it satisfies. If two `WithProvided` values satisfy the same requested type, resolving it **panics** with `AmbiguousInjectable` — a wrong match is never silent. To replace a provider on purpose, use `WithOverride`: it shadows older providers it overlaps with, per resolved type, and the newest override wins.
 
 ```go
 ctx = ioc.WithProvided(ctx, &defaultGreeter{})
-ctx = ioc.WithProvided(ctx, &customGreeter{})
+ctx = ioc.WithOverride(ctx, &customGreeter{}) // intentionally shadows the default
 
 g := ioc.GetProvided[Greeter](ctx) // resolves customGreeter
+
+// Two plain providers for the same interface, on the other hand, panic:
+ctx = ioc.WithProvided(ctx, &defaultGreeter{}, &customGreeter{})
+ioc.GetProvided[Greeter](ctx) // panics AmbiguousInjectable
+```
+
+Ambiguity is a wiring error, not an absence, so it panics in **all three** resolvers — including `GetOptionalProvided` and `IsProvided`.
+
+### Pinning with `As`
+
+`As[I](impl)` registers `impl` to resolve **only** as the exact type `I`. The compiler rejects an `impl` that doesn't implement `I`, and at resolve time `impl` matches `I` and nothing else — not a sub-interface of `I`, not some other interface `impl` happens to satisfy.
+
+```go
+// emailService has Send() and Compose(); without pinning it would also resolve
+// as io.Closer, fmt.Stringer, or any other shape it incidentally satisfies.
+ctx = ioc.WithProvided(ctx, ioc.As[Emailer](&emailService{}))
+
+ioc.GetProvided[Emailer](ctx)  // resolves
+ioc.IsProvided[Notifier](ctx)  // false — pinned to Emailer only
+```
+
+Pinning is opt-in: plain `WithProvided` keeps full structural resolution. Reach for `As` when you want a provider to resolve as exactly the types you name — including third-party interfaces you can't otherwise constrain.
+
+### Avoiding accidental matches
+
+Resolution is structural: a value matches every interface its method set covers. Two levers keep that from matching something you didn't intend:
+
+- **`As[I](impl)` — per provider.** Pin a specific impl to exact types (above). Works on any interface, including ones you don't own.
+- **Branded interfaces — per interface.** Give a domain interface an unexported marker method so nothing satisfies it by accident, across all providers.
+
+```go
+type Greeter interface {
+	Greet() string
+	greeter() // unexported — only your impls can satisfy it
+}
 ```
 
 ### Inheritance through derived contexts
@@ -131,21 +166,30 @@ func GetOptionalProvided[T any](ctx context.Context) (T, bool)
 // Report whether a value satisfying T is available.
 func IsProvided[T any](ctx context.Context) bool
 
-// Return a context carrying the given injectables (values or zero-arg factory funcs).
+// Return a context carrying the given injectables (values, zero-arg factory funcs, or As pins).
+// Resolving a type satisfied by two of them panics with AmbiguousInjectable.
 func WithProvided[TContext context.Context](ctx TContext, injectables ...any) context.Context
+
+// Like WithProvided, but each injectable shadows older providers it overlaps with.
+func WithOverride[TContext context.Context](ctx TContext, injectables ...any) context.Context
+
+// Pin impl to resolve only as the exact type I. Pass the result to WithProvided/WithOverride.
+func As[I any](impl I) any
 ```
 
 ### Errors
 
 ```go
 var (
-	InjectionError    // base sentinel for all injection failures
-	InvalidInjectable // nil injectable (incl. typed-nil pointer/func), or a malformed factory
-	MissingInjectable // no provided value satisfies the requested type
+	InjectionError      // base sentinel for all injection failures
+	InvalidInjectable   // nil injectable (incl. typed-nil pointer/func), or a malformed factory
+	MissingInjectable   // no provided value satisfies the requested type
+	AmbiguousInjectable // two providers satisfy the requested type
+	CircularInjectable  // a factory depends on itself (directly or through a cycle)
 )
 ```
 
-Both `InvalidInjectable` and `MissingInjectable` derive from `InjectionError`, so `errors.Is(err, ioc.InjectionError)` matches either. Failures surface as panics; recover and match with `errors.Is`.
+All four derive from `InjectionError`, so `errors.Is(err, ioc.InjectionError)` matches any of them. Failures surface as panics; recover and match with `errors.Is`.
 
 ## License
 

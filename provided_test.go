@@ -236,23 +236,20 @@ func TestGetProvidedWithNestedContexts1(t *testing.T) {
 }
 
 func TestAmbiguousInjectablePanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			if err, ok := r.(error); ok && errors.Is(err, AmbiguousInjectable) {
+				return
+			}
+			t.Fatalf("Expected AmbiguousInjectable panic, got %v", r)
+		}
+		t.Fatal("Expected panic for two providers matching ServeService, but code did not panic")
+	}()
+
 	ctx := context.Background()
-	advancedService := &AdvancedServiceImpl{}
-	service := &_ServeServiceImpl{}
+	ctx = WithProvided(ctx, &AdvancedServiceImpl{}, &_ServeServiceImpl{})
 
-	// Provide both AdvancedServiceImpl and ServiceImpl
-	ctx = WithProvided(ctx, advancedService, service)
-
-	// Retrieve the Service interface - should return the most recently provided (service)
-	retrievedService := GetProvided[ServeService](ctx)
-	if retrievedService == nil {
-		t.Fatal("Expected to retrieve Service, got nil")
-	}
-
-	// Should return the ServiceImpl (most recent)
-	if retrievedService.Serve() != "Service is serving" {
-		t.Fatalf("Expected Service from ServiceImpl, got: %s", retrievedService.Serve())
-	}
+	_ = GetProvided[ServeService](ctx)
 }
 
 func TestRetrieveSpecificInterface(t *testing.T) {
@@ -305,22 +302,30 @@ func TestNoAmbiguityWithSingleImplementation(t *testing.T) {
 }
 
 func TestAmbiguityDueToOverlappingInterfaces(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			if err, ok := r.(error); ok && errors.Is(err, AmbiguousInjectable) {
+				return
+			}
+			t.Fatalf("Expected AmbiguousInjectable panic, got %v", r)
+		}
+		t.Fatal("Expected panic for overlapping ServeService providers, but code did not panic")
+	}()
+
 	ctx := context.Background()
-	advancedService := &AdvancedServiceImpl{}
-	service := &_ServeServiceImpl{}
+	ctx = WithProvided(ctx, &_ServeServiceImpl{}, &AdvancedServiceImpl{})
 
-	// Provide both AdvancedServiceImpl and ServiceImpl
-	ctx = WithProvided(ctx, service, advancedService)
+	_ = GetProvided[ServeService](ctx)
+}
 
-	// Retrieve the Service interface - should return the most recently provided (advancedService)
+func TestOverrideResolvesOverlappingInterfaces(t *testing.T) {
+	ctx := context.Background()
+	ctx = WithProvided(ctx, &_ServeServiceImpl{})
+	ctx = WithOverride(ctx, &AdvancedServiceImpl{})
+
 	retrievedService := GetProvided[ServeService](ctx)
-	if retrievedService == nil {
-		t.Fatal("Expected to retrieve Service, got nil")
-	}
-
-	// Should return the AdvancedServiceImpl (most recent)
 	if retrievedService.Serve() != "Advanced Service is serving" {
-		t.Fatalf("Expected Service from AdvancedServiceImpl, got: %s", retrievedService.Serve())
+		t.Fatalf("Expected AdvancedServiceImpl via override, got: %s", retrievedService.Serve())
 	}
 }
 
@@ -775,7 +780,7 @@ func TestGetOptionalProvidedWithCallableInjectable(t *testing.T) {
 func TestGetOptionalProvidedReturnsLatestOverride(t *testing.T) {
 	var ctx = context.Background()
 	ctx = WithProvided(ctx, &_ServeServiceImpl{})
-	ctx = WithProvided(ctx, &AdvancedServiceImpl{})
+	ctx = WithOverride(ctx, &AdvancedServiceImpl{})
 
 	value, found := GetOptionalProvided[ServeService](ctx)
 	if !found {
@@ -847,7 +852,7 @@ func TestNestedOverride(t *testing.T) {
 		t.Fatal("expected B")
 	}
 
-	ctx = WithProvided(ctx, &_DoAServiceImpl2{})
+	ctx = WithOverride(ctx, &_DoAServiceImpl2{})
 	var a3 = GetProvided[ServiceA](ctx)
 	if a3.DoA() != "A-Alternate" {
 		t.Fatal("expected A-Alternate")
