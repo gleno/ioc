@@ -13,11 +13,10 @@ go get github.com/gleno/ioc
 - **Context-scoped.** Injectables live on a `context.Context`. Anything that has the context can resolve them; child contexts inherit everything from their parents.
 - **Resolve by type.** `GetProvided[T]` matches a stored value against the requested type `T` — interface or concrete — using Go's normal type assertion. One implementation can satisfy many interfaces.
 - **Generic, no reflection at the call site.** Resolution is type-safe; you get a `T` back, not an `any` to cast.
-- **Lazy factories.** Provide a zero-arg function `func() T` and it's invoked at most once — the first time a `T` is resolved (`sync.OnceValue`), and never as a side effect of resolving an unrelated type. A factory resolves as its declared return type `T`, which must be a concrete or named-interface type (not `interface{}`).
-- **Configurable factory panic handling.** Lazy factory panics are loud by default, but a context can opt into handling them with `OnPanic` or silencing them with `SilencePanics`.
+- **Values only.** Injectables are already-constructed values. Functions are rejected with `InvalidInjectable`; they are not treated as lazy factories or injectable function values.
 - **Ambiguity is loud.** If two providers satisfy the requested type, resolution **panics** rather than silently picking one. Replace a provider deliberately with `WithOverride`; pin a provider to exact types with `As`.
 - **Three resolution modes.** Panic-on-missing (`GetProvided`), boolean check (`IsProvided`), and optional `(T, bool)` (`GetOptionalProvided`).
-- **Typed errors.** Failures are `fault` sentinels (`MissingInjectable`, `InvalidInjectable`, `AmbiguousInjectable`, `CircularInjectable`) you can match with `errors.Is`.
+- **Typed errors.** Failures are `fault` sentinels (`MissingInjectable`, `InvalidInjectable`, `AmbiguousInjectable`) you can match with `errors.Is`.
 
 ## Usage
 
@@ -84,38 +83,7 @@ a := ioc.GetProvided[ServiceA](ctx)
 b := ioc.GetProvided[ServiceB](ctx)
 ```
 
-### Lazy factories
-
-Provide a zero-argument function returning the value. It's evaluated lazily on first resolve and cached — every later resolve returns the same instance.
-
-```go
-ctx = ioc.WithProvided(ctx, func() Greeter {
-	return &service{} // constructed once, on first GetProvided
-})
-
-g := ioc.GetProvided[Greeter](ctx) // factory runs here
-```
-
-A factory must take no parameters and return exactly one value of a concrete or named-interface type, or `WithProvided` panics with `InvalidInjectable` — a `func() any` is rejected at registration, since its declared type carries no resolution information. A factory resolves only as its declared return type, and is invoked only when that type is requested. If the factory returns nil, the panic happens on first resolve, not at registration.
-
-### Handling factory panics
-
-Lazy factory panics propagate by default. To treat a factory panic as absence for a subtree of contexts, install a handler with `OnPanic`. Handlers run newest-to-oldest; returning `true` handles the panic, and returning `false` lets older handlers try.
-
-```go
-ctx = ioc.OnPanic(ctx, func(recovered any) bool {
-	err, ok := recovered.(error)
-	return ok && errors.Is(err, transientStartupFailure)
-})
-```
-
-When a factory panic is handled, `GetOptionalProvided[T]` returns `(zero, false)`, `IsProvided[T]` returns `false`, and `GetProvided[T]` panics with `MissingInjectable`. To handle every lazy factory panic, use `SilencePanics`.
-
-```go
-ctx = ioc.SilencePanics(ctx)
-```
-
-`OnPanic` only handles panics recovered from lazy factory resolution. Wiring errors such as ambiguous providers, invalid registration, missing required dependencies, and resolving `any` still panic normally.
+Functions are not valid injectables. `WithProvided(ctx, func() T { ... })`, `WithOverride(ctx, fn)`, and `As[SomeFuncType](fn)` all panic with `InvalidInjectable`.
 
 ### Ambiguity and overrides
 
@@ -186,12 +154,7 @@ func GetOptionalProvided[T any](ctx context.Context) (T, bool)
 // Report whether a value satisfying T is available.
 func IsProvided[T any](ctx context.Context) bool
 
-// Handle panics recovered while resolving lazy factories.
-type PanicHandler func(any) bool
-func OnPanic(ctx context.Context, handler PanicHandler) context.Context
-func SilencePanics(ctx context.Context) context.Context
-
-// Return a context carrying the given injectables (values, zero-arg factory funcs, or As pins).
+// Return a context carrying the given injectables (values or As pins).
 // Resolving a type satisfied by two of them panics with AmbiguousInjectable.
 func WithProvided[TContext context.Context](ctx TContext, injectables ...any) context.Context
 
@@ -207,14 +170,13 @@ func As[I any](impl I) any
 ```go
 var (
 	InjectionError      // base sentinel for all injection failures
-	InvalidInjectable   // nil injectable (incl. typed-nil pointer/func), or a malformed factory
+	InvalidInjectable   // nil injectable (incl. typed-nil pointer/func), or any function injectable
 	MissingInjectable   // no provided value satisfies the requested type
 	AmbiguousInjectable // two providers satisfy the requested type
-	CircularInjectable  // a factory depends on itself (directly or through a cycle)
 )
 ```
 
-All four derive from `InjectionError`, so `errors.Is(err, ioc.InjectionError)` matches any of them. Failures surface as panics; recover and match with `errors.Is`.
+All three derive from `InjectionError`, so `errors.Is(err, ioc.InjectionError)` matches any of them. Failures surface as panics; recover and match with `errors.Is`.
 
 ## License
 

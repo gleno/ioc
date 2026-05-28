@@ -47,24 +47,6 @@ func TestPlainCollisionPanics(t *testing.T) {
 	_ = GetProvided[Notifier](ctx)
 }
 
-func TestAmbiguousFactoriesPanicWithoutInvocation(t *testing.T) {
-	var calls int
-	first := func() *_DoAServiceImpl { calls++; return &_DoAServiceImpl{} }
-	second := func() *_DoAServiceImpl2 { calls++; return &_DoAServiceImpl2{} }
-	ctx := WithProvided(context.Background(), first, second)
-
-	defer func() {
-		r := recover()
-		if err, ok := r.(error); !ok || !errors.Is(err, AmbiguousInjectable) {
-			t.Fatalf("expected AmbiguousInjectable panic, got %v", r)
-		}
-		if calls != 0 {
-			t.Fatalf("factories invoked %d times before ambiguity was detected, want 0", calls)
-		}
-	}()
-	_ = GetProvided[ServiceA](ctx)
-}
-
 func TestGetOptionalProvidedPanicsOnAmbiguity(t *testing.T) {
 	defer expectAmbiguousPanic(t, "GetOptionalProvided ambiguity")
 	ctx := WithProvided(context.Background(), &_DoAServiceImpl{}, &_DoAServiceImpl2{})
