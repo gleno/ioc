@@ -14,6 +14,7 @@ go get github.com/gleno/ioc
 - **Resolve by type.** `GetProvided[T]` matches a stored value against the requested type `T` — interface or concrete — using Go's normal type assertion. One implementation can satisfy many interfaces.
 - **Generic, no reflection at the call site.** Resolution is type-safe; you get a `T` back, not an `any` to cast.
 - **Lazy factories.** Provide a zero-arg function `func() T` and it's invoked at most once — the first time a `T` is resolved (`sync.OnceValue`), and never as a side effect of resolving an unrelated type. A factory resolves as its declared return type `T`, which must be a concrete or named-interface type (not `interface{}`).
+- **Configurable factory panic handling.** Lazy factory panics are loud by default, but a context can opt into handling them with `OnPanic` or silencing them with `SilencePanics`.
 - **Ambiguity is loud.** If two providers satisfy the requested type, resolution **panics** rather than silently picking one. Replace a provider deliberately with `WithOverride`; pin a provider to exact types with `As`.
 - **Three resolution modes.** Panic-on-missing (`GetProvided`), boolean check (`IsProvided`), and optional `(T, bool)` (`GetOptionalProvided`).
 - **Typed errors.** Failures are `fault` sentinels (`MissingInjectable`, `InvalidInjectable`, `AmbiguousInjectable`, `CircularInjectable`) you can match with `errors.Is`.
@@ -97,6 +98,25 @@ g := ioc.GetProvided[Greeter](ctx) // factory runs here
 
 A factory must take no parameters and return exactly one value of a concrete or named-interface type, or `WithProvided` panics with `InvalidInjectable` — a `func() any` is rejected at registration, since its declared type carries no resolution information. A factory resolves only as its declared return type, and is invoked only when that type is requested. If the factory returns nil, the panic happens on first resolve, not at registration.
 
+### Handling factory panics
+
+Lazy factory panics propagate by default. To treat a factory panic as absence for a subtree of contexts, install a handler with `OnPanic`. Handlers run newest-to-oldest; returning `true` handles the panic, and returning `false` lets older handlers try.
+
+```go
+ctx = ioc.OnPanic(ctx, func(recovered any) bool {
+	err, ok := recovered.(error)
+	return ok && errors.Is(err, transientStartupFailure)
+})
+```
+
+When a factory panic is handled, `GetOptionalProvided[T]` returns `(zero, false)`, `IsProvided[T]` returns `false`, and `GetProvided[T]` panics with `MissingInjectable`. To handle every lazy factory panic, use `SilencePanics`.
+
+```go
+ctx = ioc.SilencePanics(ctx)
+```
+
+`OnPanic` only handles panics recovered from lazy factory resolution. Wiring errors such as ambiguous providers, invalid registration, missing required dependencies, and resolving `any` still panic normally.
+
 ### Ambiguity and overrides
 
 `WithProvided` asserts that what you add is *the* provider for the types it satisfies. If two `WithProvided` values satisfy the same requested type, resolving it **panics** with `AmbiguousInjectable` — a wrong match is never silent. To replace a provider on purpose, use `WithOverride`: it shadows older providers it overlaps with, per resolved type, and the newest override wins.
@@ -165,6 +185,11 @@ func GetOptionalProvided[T any](ctx context.Context) (T, bool)
 
 // Report whether a value satisfying T is available.
 func IsProvided[T any](ctx context.Context) bool
+
+// Handle panics recovered while resolving lazy factories.
+type PanicHandler func(any) bool
+func OnPanic(ctx context.Context, handler PanicHandler) context.Context
+func SilencePanics(ctx context.Context) context.Context
 
 // Return a context carrying the given injectables (values, zero-arg factory funcs, or As pins).
 // Resolving a type satisfied by two of them panics with AmbiguousInjectable.

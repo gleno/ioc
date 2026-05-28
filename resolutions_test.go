@@ -27,6 +27,34 @@ func expectInvalidPanic(t *testing.T, what string, fn func()) {
 	fn()
 }
 
+func expectMissingPanic(t *testing.T, what string, fn func()) {
+	t.Helper()
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("%s: expected MissingInjectable panic, did not panic", what)
+		}
+		if err, ok := r.(error); !ok || !errors.Is(err, MissingInjectable) {
+			t.Fatalf("%s: expected MissingInjectable panic, got %v", what, r)
+		}
+	}()
+	fn()
+}
+
+func expectPanicValue(t *testing.T, what string, want any, fn func()) {
+	t.Helper()
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("%s: expected panic %v, did not panic", what, want)
+		}
+		if r != want {
+			t.Fatalf("%s: expected panic %v, got %v", what, want, r)
+		}
+	}()
+	fn()
+}
+
 func TestSelfDependencyPanicsCircular(t *testing.T) {
 	r := runGuarded(t, func() {
 		var ctx context.Context
@@ -97,9 +125,28 @@ func TestResolveAnyIsRejected(t *testing.T) {
 	}
 }
 
-func TestQueryAPIsReportAbsentOnBrokenMatchingFactory(t *testing.T) {
+func TestFactoryPanicsPropagateByDefault(t *testing.T) {
 	brokenCtx := func() context.Context {
 		return WithProvided(context.Background(), func() ServeService {
+			panic("factory boom")
+		})
+	}
+
+	expectPanicValue(t, "IsProvided default panic", "factory boom", func() {
+		_ = IsProvided[ServeService](brokenCtx())
+	})
+	expectPanicValue(t, "GetOptionalProvided default panic", "factory boom", func() {
+		_, _ = GetOptionalProvided[ServeService](brokenCtx())
+	})
+	expectPanicValue(t, "GetProvided default panic", "factory boom", func() {
+		_ = GetProvided[ServeService](brokenCtx())
+	})
+}
+
+func TestSilencePanicsReportsAbsentOnBrokenMatchingFactory(t *testing.T) {
+	brokenCtx := func() context.Context {
+		ctx := SilencePanics(context.Background())
+		return WithProvided(ctx, func() ServeService {
 			var nilImpl *_ServeServiceImpl = nil
 			return nilImpl
 		})
@@ -110,6 +157,151 @@ func TestQueryAPIsReportAbsentOnBrokenMatchingFactory(t *testing.T) {
 	}
 	if v, found := GetOptionalProvided[ServeService](brokenCtx()); found || v != nil {
 		t.Fatalf("GetOptionalProvided must report (nil,false) for a broken matching factory; got (%v,%v)", v, found)
+	}
+}
+
+func TestSilencePanicsMakesGetProvidedPanicMissing(t *testing.T) {
+	ctx := SilencePanics(context.Background())
+	ctx = WithProvided(ctx, func() ServeService {
+		panic("factory boom")
+	})
+
+	expectMissingPanic(t, "GetProvided with silenced factory panic", func() {
+		_ = GetProvided[ServeService](ctx)
+	})
+}
+
+func TestOnPanicFalsePropagatesOriginalPanic(t *testing.T) {
+	var calls int
+	ctx := OnPanic(context.Background(), func(recovered any) bool {
+		calls++
+		return false
+	})
+	ctx = WithProvided(ctx, func() ServeService {
+		panic("factory boom")
+	})
+
+	expectPanicValue(t, "unhandled OnPanic", "factory boom", func() {
+		_, _ = GetOptionalProvided[ServeService](ctx)
+	})
+	if calls != 1 {
+		t.Fatalf("expected handler to be called once, got %d", calls)
+	}
+}
+
+func TestOnPanicHandlersChainNewestToOldest(t *testing.T) {
+	var order []string
+	ctx := OnPanic(context.Background(), func(recovered any) bool {
+		order = append(order, "old")
+		return true
+	})
+	ctx = OnPanic(ctx, func(recovered any) bool {
+		order = append(order, "new")
+		return false
+	})
+	ctx = WithProvided(ctx, func() ServeService {
+		panic("factory boom")
+	})
+
+	if value, found := GetOptionalProvided[ServeService](ctx); found || value != nil {
+		t.Fatalf("expected handled factory panic to report absent, got (%v,%v)", value, found)
+	}
+	if len(order) != 2 || order[0] != "new" || order[1] != "old" {
+		t.Fatalf("expected handlers to run newest-to-oldest, got %v", order)
+	}
+}
+
+func TestOnPanicStopsAtFirstHandledPanic(t *testing.T) {
+	var calls int
+	ctx := OnPanic(context.Background(), func(recovered any) bool {
+		calls++
+		return false
+	})
+	ctx = OnPanic(ctx, func(recovered any) bool {
+		calls++
+		return true
+	})
+	ctx = WithProvided(ctx, func() ServeService {
+		panic("factory boom")
+	})
+
+	_, found := GetOptionalProvided[ServeService](ctx)
+	if found {
+		t.Fatal("expected handled factory panic to report absent")
+	}
+	if calls != 1 {
+		t.Fatalf("expected only the newest handler to be called, got %d calls", calls)
+	}
+}
+
+func TestOnPanicInheritedThroughDerivedContext(t *testing.T) {
+	parent := OnPanic(context.Background(), func(recovered any) bool {
+		return true
+	})
+	child := context.WithValue(parent, "key", "value")
+	child = WithProvided(child, func() ServeService {
+		panic("factory boom")
+	})
+
+	if value, found := GetOptionalProvided[ServeService](child); found || value != nil {
+		t.Fatalf("expected inherited panic handler to report absent, got (%v,%v)", value, found)
+	}
+}
+
+func TestOnPanicHandlerPanicPropagates(t *testing.T) {
+	ctx := OnPanic(context.Background(), func(recovered any) bool {
+		panic("handler boom")
+	})
+	ctx = WithProvided(ctx, func() ServeService {
+		panic("factory boom")
+	})
+
+	expectPanicValue(t, "panic handler panic", "handler boom", func() {
+		_, _ = GetOptionalProvided[ServeService](ctx)
+	})
+}
+
+func TestOnPanicRejectsNilHandler(t *testing.T) {
+	expectInvalidPanic(t, "nil panic handler", func() {
+		_ = OnPanic(context.Background(), nil)
+	})
+}
+
+func TestOnPanicDoesNotHandleNonFactoryPanics(t *testing.T) {
+	var calls int
+	ctx := OnPanic(context.Background(), func(recovered any) bool {
+		calls++
+		return true
+	})
+
+	func() {
+		defer expectAmbiguousPanic(t, "ambiguous provider")
+		ambiguous := WithProvided(ctx, &_DoAServiceImpl{}, &_DoAServiceImpl2{})
+		_ = GetProvided[ServiceA](ambiguous)
+	}()
+	if calls != 0 {
+		t.Fatalf("ambiguous provider called panic handler %d times", calls)
+	}
+
+	expectMissingPanic(t, "missing provider", func() {
+		_ = GetProvided[ServiceA](ctx)
+	})
+	if calls != 0 {
+		t.Fatalf("missing provider called panic handler %d times", calls)
+	}
+
+	expectInvalidPanic(t, "resolve any", func() {
+		_ = GetProvided[any](ctx)
+	})
+	if calls != 0 {
+		t.Fatalf("resolve any called panic handler %d times", calls)
+	}
+
+	expectInvalidPanic(t, "invalid registration", func() {
+		_ = WithProvided(ctx, nil)
+	})
+	if calls != 0 {
+		t.Fatalf("invalid registration called panic handler %d times", calls)
 	}
 }
 

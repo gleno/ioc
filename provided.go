@@ -13,8 +13,10 @@ import (
 )
 
 type iocContextKeyType struct{}
+type panicContextKeyType struct{}
 
 var iocContextKey = iocContextKeyType{}
+var panicContextKey = panicContextKeyType{}
 
 var (
 	InjectionError      = fault.Sentinel("injection error")
@@ -37,6 +39,15 @@ func (l *_lazyInjectable) tryResolve() (value any, recovered any) {
 type _pinned struct {
 	value any
 	types []reflect.Type
+}
+
+// PanicHandler handles a panic recovered while resolving a lazy factory.
+// Return true to treat that factory as absent, or false to let older handlers try.
+type PanicHandler func(any) bool
+
+type _panicContext struct {
+	parent  *_panicContext
+	handler PanicHandler
 }
 
 type _iocContext struct {
@@ -71,7 +82,7 @@ func resolveInjectable[T any](ic *_iocContext) (value T, recovered any) {
 	}
 }
 
-func findProvided[T any](ctx context.Context) (value T, found bool, recovered any) {
+func findProvided[T any](ctx context.Context) (value T, found bool) {
 
 	var tType = reflect.TypeFor[T]()
 	if tType.Kind() == reflect.Interface && tType.NumMethod() == 0 {
@@ -93,23 +104,23 @@ func findProvided[T any](ctx context.Context) (value T, found bool, recovered an
 
 	switch len(live) {
 	case 0:
-		return value, false, nil
+		return value, false
 	case 1:
 		resolved, recovered := resolveInjectable[T](live[0])
 		if recovered != nil {
-			return value, false, recovered
+			if !handleRecoveredPanic(ctx, recovered) {
+				panic(recovered)
+			}
+			return value, false
 		}
-		return resolved, true, nil
+		return resolved, true
 	default:
 		panic(fault.From(AmbiguousInjectable, fmt.Sprintf("%s (%d matches)", tType, len(live))))
 	}
 }
 
 func GetProvided[T any](ctx context.Context) T {
-	value, found, recovered := findProvided[T](ctx)
-	if recovered != nil {
-		panic(recovered)
-	}
+	value, found := findProvided[T](ctx)
 	if !found {
 		panic(fault.From(MissingInjectable, reflect.TypeFor[T]().String()))
 	}
@@ -117,13 +128,42 @@ func GetProvided[T any](ctx context.Context) T {
 }
 
 func IsProvided[T any](ctx context.Context) bool {
-	_, found, _ := findProvided[T](ctx)
+	_, found := findProvided[T](ctx)
 	return found
 }
 
 func GetOptionalProvided[T any](ctx context.Context) (T, bool) {
-	value, found, _ := findProvided[T](ctx)
+	value, found := findProvided[T](ctx)
 	return value, found
+}
+
+// OnPanic returns a context with a handler for panics recovered while resolving lazy factories.
+func OnPanic(ctx context.Context, handler PanicHandler) context.Context {
+	if handler == nil {
+		panic(fault.From(InvalidInjectable, "nil panic handler"))
+	}
+	panicContext, _ := ctx.Value(panicContextKey).(*_panicContext)
+	return context.WithValue(ctx, panicContextKey, &_panicContext{
+		parent:  panicContext,
+		handler: handler,
+	})
+}
+
+// SilencePanics returns a context that treats all lazy factory panics as handled.
+func SilencePanics(ctx context.Context) context.Context {
+	return OnPanic(ctx, func(any) bool {
+		return true
+	})
+}
+
+func handleRecoveredPanic(ctx context.Context, recovered any) bool {
+	panicContext, _ := ctx.Value(panicContextKey).(*_panicContext)
+	for pc := panicContext; pc != nil; pc = pc.parent {
+		if pc.handler(recovered) {
+			return true
+		}
+	}
+	return false
 }
 
 func As[I any](impl I) any {
