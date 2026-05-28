@@ -6,8 +6,8 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/gleno/fault"
 )
@@ -29,6 +29,10 @@ var (
 type _lazyInjectable struct {
 	resolve func() any
 	outType reflect.Type
+}
+
+type _circularDependencyPanic struct {
+	recovered any
 }
 
 func (l *_lazyInjectable) tryResolve() (value any, recovered any) {
@@ -108,6 +112,9 @@ func findProvided[T any](ctx context.Context) (value T, found bool) {
 	case 1:
 		resolved, recovered := resolveInjectable[T](live[0])
 		if recovered != nil {
+			if circular, ok := recovered.(_circularDependencyPanic); ok {
+				panic(circular.recovered)
+			}
 			if !handleRecoveredPanic(ctx, recovered) {
 				panic(recovered)
 			}
@@ -239,11 +246,16 @@ func buildFactory(injectableValue reflect.Value) *_lazyInjectable {
 		panic(fault.From(InvalidInjectable, "factory must return a concrete type, not interface{}"))
 	}
 
-	var owner atomic.Int64
-	var once = sync.OnceValue(func() any {
-		owner.Store(goid())
-		defer owner.Store(0)
+	var mu sync.Mutex
+	var cond = sync.NewCond(&mu)
+	var owner int64
+	var didResolve bool
+	var resolved any
+	var didPanic bool
+	var resolvePanic any
 
+	var resolveFactory = func() (value any, recovered any) {
+		defer func() { recovered = recover() }()
 		var result = injectableValue.Call(nil)[0]
 		var produced = result
 		if produced.Kind() == reflect.Interface {
@@ -256,14 +268,49 @@ func buildFactory(injectableValue reflect.Value) *_lazyInjectable {
 			panic(fault.From(InvalidInjectable, "function returned nil"))
 		}
 
-		return result.Interface()
-	})
+		return result.Interface(), nil
+	}
 
 	var resolve = func() any {
-		if o := owner.Load(); o != 0 && o == goid() {
-			panic(fault.From(CircularInjectable, outType.String()))
+		var current = goid()
+
+		mu.Lock()
+		for {
+			switch {
+			case didResolve:
+				value := resolved
+				mu.Unlock()
+				return value
+			case didPanic:
+				recovered := resolvePanic
+				mu.Unlock()
+				panic(recovered)
+			case owner == 0:
+				owner = current
+				mu.Unlock()
+				result, recovered := resolveFactory()
+				mu.Lock()
+				owner = 0
+				if recovered != nil {
+					didPanic = true
+					resolvePanic = recovered
+				} else {
+					didResolve = true
+					resolved = result
+				}
+				cond.Broadcast()
+				mu.Unlock()
+				if recovered != nil {
+					panic(recovered)
+				}
+				return result
+			case current == owner || isDescendantGoroutine(current, owner):
+				mu.Unlock()
+				panic(_circularDependencyPanic{recovered: fault.From(CircularInjectable, outType.String())})
+			default:
+				cond.Wait()
+			}
 		}
-		return once()
 	}
 
 	return &_lazyInjectable{resolve: resolve, outType: outType}
@@ -281,6 +328,60 @@ func goid() int64 {
 	var buf [32]byte
 	var s = buf[:runtime.Stack(buf[:], false)]
 	s = s[len("goroutine "):]
+	return parseGoroutineID(string(s))
+}
+
+func isDescendantGoroutine(child, ancestor int64) bool {
+	if child == 0 || ancestor == 0 {
+		return false
+	}
+	parents := goroutineParents()
+	seen := map[int64]struct{}{}
+	for parent := parents[child]; parent != 0; parent = parents[parent] {
+		if parent == ancestor {
+			return true
+		}
+		if _, ok := seen[parent]; ok {
+			return false
+		}
+		seen[parent] = struct{}{}
+	}
+	return false
+}
+
+func goroutineParents() map[int64]int64 {
+	buf := make([]byte, 1<<16)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, len(buf)*2)
+	}
+
+	parents := map[int64]int64{}
+	for _, block := range strings.Split(string(buf), "\n\n") {
+		if !strings.HasPrefix(block, "goroutine ") {
+			continue
+		}
+		id := parseGoroutineID(block[len("goroutine "):])
+		if id == 0 {
+			continue
+		}
+		idx := strings.LastIndex(block, " in goroutine ")
+		if idx == -1 {
+			continue
+		}
+		parent := parseGoroutineID(block[idx+len(" in goroutine "):])
+		if parent != 0 {
+			parents[id] = parent
+		}
+	}
+	return parents
+}
+
+func parseGoroutineID(s string) int64 {
 	var id int64
 	for _, c := range s {
 		if c < '0' || c > '9' {
