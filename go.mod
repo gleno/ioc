@@ -1,6 +1,6 @@
 module github.com/gleno/ioc
 
-go 1.26.2
+go 1.27.3
 
 require github.com/gleno/fault v1.0.4
 
