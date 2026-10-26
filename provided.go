@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"reflect"
-	"slices"
 
 	"github.com/gleno/fault"
 )
@@ -21,8 +20,8 @@ var (
 )
 
 type _pinned struct {
-	value any
-	types []reflect.Type
+	value  any
+	target reflect.Type
 }
 
 type _iocContext struct {
@@ -31,50 +30,41 @@ type _iocContext struct {
 	override   bool
 }
 
-func (ic *_iocContext) matches(t reflect.Type) bool {
-	switch inj := ic.injectable.(type) {
-	case *_pinned:
-		return slices.Contains(inj.types, t)
-	default:
-		return reflect.TypeOf(ic.injectable).AssignableTo(t)
-	}
-}
-
-func resolveInjectable[T any](ic *_iocContext) T {
-	switch inj := ic.injectable.(type) {
-	case *_pinned:
-		return inj.value.(T)
-	default:
-		return ic.injectable.(T)
-	}
-}
-
 func findProvided[T any](ctx context.Context) (value T, found bool) {
 	var tType = reflect.TypeFor[T]()
-	if tType.Kind() == reflect.Interface && tType.NumMethod() == 0 {
-		panic(fault.From(InvalidInjectable, "cannot resolve interface{}"))
-	}
+	validateResolvableType(tType)
 
 	iocContext, _ := ctx.Value(iocContextKey).(*_iocContext)
 
-	var live []*_iocContext
+	var matches int
 	for ic := iocContext; ic != nil; ic = ic.parent {
-		if !ic.matches(tType) {
+		injectable := ic.injectable
+		if pinned, ok := injectable.(*_pinned); ok {
+			if pinned.target != tType {
+				continue
+			}
+			injectable = pinned.value
+		}
+		candidate, ok := injectable.(T)
+		if !ok {
 			continue
 		}
-		live = append(live, ic)
+		if matches == 0 {
+			value = candidate
+		}
+		matches++
 		if ic.override {
 			break
 		}
 	}
 
-	switch len(live) {
+	switch matches {
 	case 0:
 		return value, false
 	case 1:
-		return resolveInjectable[T](live[0]), true
+		return value, true
 	default:
-		panic(fault.From(AmbiguousInjectable, fmt.Sprintf("%s (%d matches)", tType, len(live))))
+		panic(fault.From(AmbiguousInjectable, fmt.Sprintf("%s (%d matches)", tType, matches)))
 	}
 }
 
@@ -97,15 +87,10 @@ func GetOptionalProvided[T any](ctx context.Context) (T, bool) {
 }
 
 func As[I any](impl I) any {
-	var value = reflect.ValueOf(impl)
-	if !value.IsValid() {
-		panic(fault.From(InvalidInjectable, "nil"))
-	}
-	rejectFuncInjectable(value)
-	if isNilInjectable(value) {
-		panic(fault.From(InvalidInjectable, "nil "+value.Kind().String()))
-	}
-	return &_pinned{value: impl, types: []reflect.Type{reflect.TypeFor[I]()}}
+	validateInjectable(impl)
+	target := reflect.TypeFor[I]()
+	validateResolvableType(target)
+	return &_pinned{value: impl, target: target}
 }
 
 func WithProvided[TContext context.Context](ctx TContext, injectables ...any) context.Context {
@@ -119,47 +104,37 @@ func WithOverride[TContext context.Context](ctx TContext, injectables ...any) co
 func withInjectables(ctx context.Context, override bool, injectables []any) context.Context {
 	iocContext, _ := ctx.Value(iocContextKey).(*_iocContext)
 	for _, injectable := range injectables {
+		validateInjectable(injectable)
 		iocContext = &_iocContext{
 			parent:     iocContext,
-			injectable: buildInjectable(injectable),
+			injectable: injectable,
 			override:   override,
 		}
 	}
 	return context.WithValue(ctx, iocContextKey, iocContext)
 }
 
-func buildInjectable(injectable any) any {
-	if injectable == nil {
+func validateInjectable(injectable any) {
+	value := reflect.ValueOf(injectable)
+	if !value.IsValid() {
 		panic(fault.From(InvalidInjectable, "nil"))
 	}
 
-	if _, ok := injectable.(*_pinned); ok {
-		return injectable
+	switch value.Kind() {
+	case reflect.Func:
+		if value.IsNil() {
+			panic(fault.From(InvalidInjectable, "nil function"))
+		}
+		panic(fault.From(InvalidInjectable, "function"))
+	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Chan, reflect.UnsafePointer:
+		if value.IsNil() {
+			panic(fault.From(InvalidInjectable, "nil "+value.Kind().String()))
+		}
 	}
-
-	var injectableValue = reflect.ValueOf(injectable)
-	rejectFuncInjectable(injectableValue)
-	if isNilInjectable(injectableValue) {
-		panic(fault.From(InvalidInjectable, "nil "+injectableValue.Kind().String()))
-	}
-
-	return injectable
 }
 
-func rejectFuncInjectable(v reflect.Value) {
-	if v.Kind() != reflect.Func {
-		return
+func validateResolvableType(target reflect.Type) {
+	if target.Kind() == reflect.Interface && target.NumMethod() == 0 {
+		panic(fault.From(InvalidInjectable, "cannot resolve interface{}"))
 	}
-	if v.IsNil() {
-		panic(fault.From(InvalidInjectable, "nil function"))
-	}
-	panic(fault.From(InvalidInjectable, "function"))
-}
-
-func isNilInjectable(v reflect.Value) bool {
-	switch v.Kind() {
-	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Chan:
-		return v.IsNil()
-	}
-	return false
 }
